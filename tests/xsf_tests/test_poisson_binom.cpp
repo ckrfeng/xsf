@@ -143,6 +143,31 @@ TEMPLATE_TEST_CASE("poisson_binom_sf small upper tails", "[poisson_binom_sf][xsf
     }
 }
 
+TEMPLATE_TEST_CASE("poisson_binom_sf intermediate underflow", "[poisson_binom_sf][xsf_tests]", float, double) {
+    using T = TestType;
+    const bool is_float = std::is_same_v<T, float>;
+    const T p = is_float ? T(1.7e-23) : T(1e-162);
+    const auto n = GENERATE(2, 3, 4, 8, 16);
+    const int padding = GENERATE(0, 2);
+    // Correctly rounded references from exact rational Bernoulli convolution.
+    const int units = n == 2 ? 0 : n <= 4 ? 1 : n == 8 ? 6 : is_float ? 25 : 24;
+    const T expected = T(units) * std::numeric_limits<T>::denorm_min();
+    std::vector<T> ps(n, p);
+    if (padding) {
+        // Include deterministic trials to check that support shifts preserve the tail.
+        ps.insert(ps.begin(), T(0));
+        ps.insert(ps.begin(), T(1));
+        ps.push_back(T(1));
+        ps.push_back(T(0));
+    }
+    std::vector<T> results(ps.size() + 1, T(-1));
+
+    xsf::poisson_binom_sf_all(std::mdspan(ps.data(), ps.size()), std::mdspan(results.data(), results.size()));
+
+    CAPTURE(n, padding, results[1 + padding], expected);
+    REQUIRE(results[1 + padding] == expected);
+}
+
 TEMPLATE_TEST_CASE("poisson_binom_sf boundaries", "[poisson_binom_sf][xsf_tests]", float, double) {
     using T = TestType;
     std::vector<T> ps;

@@ -265,7 +265,8 @@ XSF_HOST_DEVICE inline float tukeylambdacdf(float x, float lmbda) {
 namespace detail {
 
     template <typename InputMat, typename OutputMat>
-    XSF_HOST_DEVICE inline void poisson_binom_pmf_all_impl(InputMat p, OutputMat res) {
+    XSF_HOST_DEVICE inline void
+    poisson_binom_pmf_all_impl(InputMat p, OutputMat res, typename OutputMat::value_type scale = 1) {
         using T = typename OutputMat::value_type;
         auto n = p.extent(0);
 
@@ -275,12 +276,12 @@ namespace detail {
         }
 
         if (n == 0) {
-            res(0) = T(1);
+            res(0) = scale;
             return;
         }
 
-        res(0) = T(1) - p(0);
-        res(1) = p(0);
+        res(0) = (T(1) - p(0)) * scale;
+        res(1) = p(0) * scale;
 
         for (decltype(n) i = 1; i < n; i++) {
             T p_i = p(i);
@@ -352,15 +353,20 @@ XSF_HOST_DEVICE inline void poisson_binom_sf_all(InputMat p, OutputMat res) {
         return;
     }
 
-    detail::poisson_binom_pmf_all_impl(p, res);
+    // A power-of-two scale preserves tiny masses during convolution. Its reciprocal
+    // is the smallest normal value, so relevant subnormal tails stay well above
+    // underflow until the final conversion back to probabilities.
+    const T unscale = cxx::numeric_limits<T>::min();
+    const T scale = T(1) / unscale;
+    detail::poisson_binom_pmf_all_impl(p, res, scale);
     // Sum the upper tail directly to avoid cancellation in 1 - cdf.
     T tail = T(0);
     for (decltype(n) i = n; i > 0; --i) {
         T mass = res(i);
-        res(i) = tail;
-        tail = cxx::min(tail + mass, T(1));
+        res(i) = tail * unscale;
+        tail = cxx::min(tail + mass, scale);
     }
-    res(0) = tail;
+    res(0) = tail * unscale;
 }
 
 template <typename InputMat, typename Int>
