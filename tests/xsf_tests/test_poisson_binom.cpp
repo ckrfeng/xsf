@@ -168,6 +168,64 @@ TEMPLATE_TEST_CASE("poisson_binom_sf intermediate underflow", "[poisson_binom_sf
     REQUIRE(results[1 + padding] == expected);
 }
 
+TEMPLATE_TEST_CASE("poisson_binom_sf subnormal rounding", "[poisson_binom_sf][xsf_tests]", float, double) {
+    using T = TestType;
+    const bool is_float = std::is_same_v<T, float>;
+    const int n = is_float ? 4 : 3;
+    const T center = is_float ? T(0x1.a20bd8p-77f) : T(0x1.a20bd700c2c3ep-539);
+    const int direction = GENERATE(-1, 0, 1);
+    const int shift = GENERATE(0, 2);
+    const T p = direction == 0 ? center : std::nextafter(center, direction < 0 ? T(0) : T(1));
+    std::vector<T> ps(n, p);
+    if (shift) {
+        ps.insert(ps.begin(), T(1));
+        ps.push_back(T(1));
+        ps.push_back(T(0));
+    }
+    std::vector<T> results(ps.size() + 1, T(-1));
+
+    xsf::poisson_binom_sf_all(std::mdspan(ps.data(), ps.size()), std::mdspan(results.data(), results.size()));
+
+    // Exact rational convolution puts center just above the zero/subnormal
+    // midpoint, and its predecessor just below it, for both types.
+    T expected = direction < 0 ? T(0) : std::numeric_limits<T>::denorm_min();
+    CAPTURE(n, direction, shift, results[1 + shift], expected);
+    REQUIRE(results[1 + shift] == expected);
+}
+
+TEMPLATE_TEST_CASE("poisson_binom_sf subnormal ties", "[poisson_binom_sf][xsf_tests]", float, double) {
+    using T = TestType;
+    constexpr int exponent = std::numeric_limits<T>::min_exponent - std::numeric_limits<T>::digits - 1;
+    const T first = std::ldexp(T(1), exponent / 2);
+    const T second = std::ldexp(T(1), exponent - exponent / 2);
+    const int direction = GENERATE(-1, 0, 1);
+    const bool extra_trial = GENERATE(false, true);
+    const bool reverse = GENERATE(false, true);
+    const int shift = GENERATE(0, 2);
+    T p = direction == 0 ? first : std::nextafter(first, direction < 0 ? T(0) : T(1));
+    std::vector<T> ps = {p, second};
+    if (extra_trial) {
+        ps.push_back(std::numeric_limits<T>::denorm_min());
+    }
+    if (shift) {
+        ps.insert(ps.begin(), T(1));
+        ps.push_back(T(1));
+    }
+    if (reverse) {
+        std::reverse(ps.begin(), ps.end());
+    }
+    std::vector<T> results(ps.size() + 1, T(-1));
+
+    xsf::poisson_binom_sf_all(std::mdspan(ps.data(), ps.size()), std::mdspan(results.data(), results.size()));
+
+    // first * second is exactly half the smallest subnormal. An additional
+    // possible success makes the tail strictly larger than the midpoint.
+    const bool positive = direction > 0 || (direction == 0 && extra_trial);
+    T expected = positive ? std::numeric_limits<T>::denorm_min() : T(0);
+    CAPTURE(direction, extra_trial, reverse, shift, results[1 + shift], expected);
+    REQUIRE(results[1 + shift] == expected);
+}
+
 TEMPLATE_TEST_CASE("poisson_binom_sf boundaries", "[poisson_binom_sf][xsf_tests]", float, double) {
     using T = TestType;
     std::vector<T> ps;

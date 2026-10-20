@@ -294,6 +294,57 @@ namespace detail {
         }
     }
 
+    // Two-component arithmetic is used only by the subnormal SF fallback.
+    struct poisson_binom_compensated {
+        double hi, lo;
+
+        XSF_HOST_DEVICE poisson_binom_compensated add(poisson_binom_compensated rhs) const {
+            volatile double sum = hi + rhs.hi;
+            volatile double part = sum - hi;
+            double error = (hi - (sum - part)) + (rhs.hi - part);
+            error += lo + rhs.lo;
+            volatile double result = sum + error;
+            return {result, error - (result - sum)};
+        }
+
+        XSF_HOST_DEVICE poisson_binom_compensated multiply(double p) const {
+            volatile double product = hi * p;
+            double error = cxx::fma(hi, p, -product) + lo * p;
+            volatile double result = product + error;
+            return {result, error - (result - product)};
+        }
+    };
+
+    template <typename InputMat, typename T>
+    XSF_HOST_DEVICE inline T poisson_binom_sf_two_successes(InputMat p, T scale) {
+        // Track zero, one, and at least two non-deterministic successes. This
+        // constant-storage recurrence avoids subtracting nearly equal CDFs.
+        poisson_binom_compensated zero{static_cast<double>(scale), 0}, one{0, 0}, tail{0, 0};
+        for (decltype(p.extent(0)) i = 0; i < p.extent(0); ++i) {
+            double probability = static_cast<double>(p(i));
+            if (probability == 0 || probability == 1) {
+                continue;
+            }
+            auto first = zero.multiply(probability);
+            auto second = one.multiply(probability);
+            tail = tail.add(second);
+            one = one.add(first).add({-second.hi, -second.lo});
+            zero = zero.add({-first.hi, -first.lo});
+        }
+
+        // Round in units of the output type's smallest subnormal. Keep the
+        // low component when deciding which side of a halfway point we are on.
+        constexpr int bits = cxx::numeric_limits<T>::digits - 1;
+        double high = cxx::ldexp(tail.hi, bits);
+        double low = cxx::ldexp(tail.lo, bits);
+        double units = cxx::floor(high);
+        double difference = (high - units) - 0.5;
+        if (difference > -low || (difference == -low && (static_cast<cxx::uint64_t>(units) & 1))) {
+            units += 1;
+        }
+        return static_cast<T>(units) * cxx::numeric_limits<T>::denorm_min();
+    }
+
 } // namespace detail
 
 template <typename InputMat, typename OutputMat>
@@ -367,6 +418,18 @@ XSF_HOST_DEVICE inline void poisson_binom_sf_all(InputMat p, OutputMat res) {
         tail = cxx::min(tail + mass, scale);
     }
     res(0) = tail * unscale;
+
+    if constexpr (cxx::is_same_v<T, float> || cxx::is_same_v<T, double>) {
+        // Recompute the first nontrivial stochastic upper tail when its
+        // conversion to a subnormal needs a more precise rounding decision.
+        decltype(n) certain = 0;
+        for (decltype(n) i = 0; i < n; ++i) {
+            certain += p(i) == T(1);
+        }
+        if (certain + 1 < n && res(certain + 1) <= unscale) {
+            res(certain + 1) = detail::poisson_binom_sf_two_successes(p, scale);
+        }
+    }
 }
 
 template <typename InputMat, typename Int>

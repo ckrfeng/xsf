@@ -108,6 +108,129 @@ class TestCuPy:
     def _adjust_tol(self, tol, *, wiggle=16):
         return wiggle * np.maximum(tol, np.finfo(tol.dtype).eps)
 
+    @pytest.mark.parametrize("dtype", [np.float32, np.float64])
+    @pytest.mark.parametrize("order", ["C", "F"])
+    @pytest.mark.parametrize("case", [
+        "dyadic", "heterogeneous", "tiny", "underflow", "round-up",
+        "round-down", "tie", "tie-extra", "shifted", "empty", "below-range",
+        "deterministic",
+    ])
+    def test_poisson_binom_sf(self, dtype, order, case):
+        from fractions import Fraction
+
+        info = np.finfo(dtype)
+        subnormal = dtype(info.smallest_subnormal)
+        is_float = dtype == np.float32
+        center = dtype(float.fromhex(
+            "0x1.a20bd8p-77" if is_float else "0x1.a20bd700c2c3ep-539"
+        ))
+        n = 4 if is_float else 3
+        k = 1
+        if case == "dyadic":
+            p = np.array([1/8, 1/4, 1/2, 3/4], dtype=dtype)
+        elif case == "heterogeneous":
+            p = np.array([(1 + i % 9) / 128 for i in range(32)], dtype=dtype)
+            k = 23
+        elif case == "tiny":
+            p = np.full(16, 1e-20, dtype=dtype)
+            k = 0
+        elif case == "underflow":
+            p = np.full(3, 1.7e-23 if is_float else 1e-162, dtype=dtype)
+        elif case in {"round-up", "round-down", "shifted"}:
+            probability = np.nextafter(center, dtype(0)) if case == "round-down" else center
+            p = np.full(n, probability, dtype=dtype)
+            if case == "shifted":
+                p = np.concatenate(([dtype(1)], p, [dtype(1), dtype(0)]))
+                k = 3
+        elif case in {"tie", "tie-extra"}:
+            exponent = info.minexp - info.nmant - 1
+            first_exponent = int(exponent / 2)
+            p = np.array([
+                np.ldexp(dtype(1), first_exponent),
+                np.ldexp(dtype(1), exponent - first_exponent),
+            ], dtype=dtype)
+            if case == "tie-extra":
+                p = np.append(p, subnormal)
+        elif case == "empty":
+            p = np.empty(0, dtype=dtype)
+            k = 0
+        elif case == "below-range":
+            p = np.full(256, 1/128, dtype=dtype)
+            k = 249
+        else:
+            p = np.array([0, 1, 0, 1], dtype=dtype)
+
+        # Exact references for the actual binary inputs, including subnormal
+        # rounding without an intermediate conversion through double precision.
+        pmf = [Fraction(1)]
+        for probability in map(lambda x: Fraction(float(x)), p):
+            updated = [Fraction(0)] * (len(pmf) + 1)
+            for j, mass in enumerate(pmf):
+                updated[j] += mass * (1 - probability)
+                updated[j + 1] += mass * probability
+            pmf = updated
+        references = []
+        tail = Fraction(0)
+        for mass in reversed(pmf):
+            if tail < Fraction(float(info.tiny)):
+                value = dtype(round(tail / Fraction(float(subnormal)))) * subnormal
+            else:
+                value = dtype(float(tail))
+            references.append(value)
+            tail += mass
+        expected = np.array(references[::-1], dtype=dtype)
+
+        scalar = "float" if is_float else "double"
+        code = get_preamble("xsf/stats.h") + r"""
+        template <typename T>
+        struct PoissonBinomialView {
+            using value_type = T;
+            T *data;
+            long long size, stride;
+            __device__ long long extent(int) const { return size; }
+            __device__ T &operator()(long long i) const { return data[i * stride]; }
+        };
+        extern "C" __global__ void poisson_binom_sf(
+            const SCALAR *p, SCALAR *out, SCALAR *selected,
+            long long n, long long rows, long long p_row, long long p_core,
+            long long out_row, long long out_core, long long k
+        ) {
+            long long row = blockIdx.x * blockDim.x + threadIdx.x;
+            if (row >= rows) { return; }
+            PoissonBinomialView<const SCALAR> input{p + row * p_row, n, p_core};
+            PoissonBinomialView<SCALAR> output{out + row * out_row, n + 1, out_core};
+            xsf::poisson_binom_sf_all(input, output);
+            selected[3 * row] = xsf::take_from_discrete_sf(output, -1LL);
+            selected[3 * row + 1] = xsf::take_from_discrete_sf(output, k);
+            selected[3 * row + 2] = xsf::take_from_discrete_sf(output, n);
+        }
+        """
+        kernel = cupy.RawKernel(code.replace("SCALAR", scalar), "poisson_binom_sf", options=("--std=c++17",))
+        inputs = cupy.array(np.stack([p, p[::-1]]), dtype=dtype, order=order)
+        output = cupy.empty((2, p.size + 1), dtype=dtype, order=order)
+        selected = cupy.empty((2, 3), dtype=dtype)
+        itemsize = np.dtype(dtype).itemsize
+        kernel((1,), (32,), (
+            inputs, output, selected, np.int64(p.size), np.int64(2),
+            np.int64(inputs.strides[0] // itemsize), np.int64(inputs.strides[1] // itemsize),
+            np.int64(output.strides[0] // itemsize), np.int64(output.strides[1] // itemsize), np.int64(k),
+        ))
+        result = cupy.asnumpy(output)
+        choices = cupy.asnumpy(selected)
+        desired = np.broadcast_to(expected, result.shape)
+        error = np.abs(result.astype(np.float64) - desired.astype(np.float64))
+        rtol = 32 * max(p.size, 1) * info.eps
+        assert np.all(error <= rtol * np.abs(desired.astype(np.float64)) + float(subnormal))
+        assert np.all(np.isfinite(result))
+        assert np.all((result >= 0) & (result <= 1))
+        assert np.all(result[:, 1:] <= result[:, :-1])
+        np.testing.assert_array_equal(result[:, -1], np.zeros(2, dtype=dtype))
+        np.testing.assert_allclose(choices[:, 1], expected[k], rtol=rtol, atol=float(subnormal))
+        np.testing.assert_array_equal(choices[:, 0], np.ones(2, dtype=dtype))
+        np.testing.assert_array_equal(choices[:, 2], np.zeros(2, dtype=dtype))
+        if case in {"underflow", "round-up", "round-down", "tie", "tie-extra", "shifted", "below-range"}:
+            np.testing.assert_array_equal(choices[:, 1], np.full(2, expected[k], dtype=dtype))
+
     @pytest.mark.parametrize(
         "tables_paths", get_tables_for_func("beta")
     )
