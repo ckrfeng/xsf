@@ -337,6 +337,32 @@ XSF_HOST_DEVICE inline void poisson_binom_cdf_all(InputMat p, OutputMat res) {
     res(n) = T(1);
 }
 
+template <typename InputMat, typename OutputMat>
+XSF_HOST_DEVICE inline void poisson_binom_sf_all(InputMat p, OutputMat res) {
+    /* Outputs the full sf of a Poisson-Binomial distribution.
+     * p and res have the same requirements as for poisson_binom_pmf_all.
+     * Upon completion, res(k) contains P(S > k) for k from 0 to n.
+     */
+    using T = typename OutputMat::value_type;
+    auto n = p.extent(0);
+    auto out_size = res.extent(0);
+
+    if (out_size != n + 1) {
+        set_error("_poisson_binom_sf_all", SF_ERROR_MEMORY, "out.shape[-1] must be p.shape[-1] + 1");
+        return;
+    }
+
+    detail::poisson_binom_pmf_all_impl(p, res);
+    // Sum the upper tail directly to avoid cancellation in 1 - cdf.
+    T tail = T(0);
+    for (decltype(n) i = n; i > 0; --i) {
+        T mass = res(i);
+        res(i) = tail;
+        tail = cxx::min(tail + mass, T(1));
+    }
+    res(0) = tail;
+}
+
 template <typename InputMat, typename Int>
 XSF_HOST_DEVICE inline typename InputMat::value_type take_from_pmf(InputMat pmf, Int k) {
     using T = typename InputMat::value_type;
@@ -358,6 +384,19 @@ XSF_HOST_DEVICE inline typename InputMat::value_type take_from_discrete_cdf(Inpu
         return T(1);
     }
     return cdf(k);
+}
+
+template <typename InputMat, typename Int>
+XSF_HOST_DEVICE inline typename InputMat::value_type take_from_discrete_sf(InputMat sf, Int k) {
+    using T = typename InputMat::value_type;
+    auto size = sf.extent(0);
+    if (detail::cmp_less(k, 0)) {
+        return T(1);
+    }
+    if (!detail::cmp_less(k, size - 1)) {
+        return T(0);
+    }
+    return sf(k);
 }
 
 namespace detail {
