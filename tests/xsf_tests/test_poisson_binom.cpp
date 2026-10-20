@@ -1,4 +1,7 @@
 #include "../testing_utils.h"
+#include <array>
+#include <catch2/catch_template_test_macros.hpp>
+#include <cstdint>
 #include <xsf/stats.h>
 #include <xsf/third_party/kokkos/mdspan.hpp>
 
@@ -79,4 +82,146 @@ TEST_CASE("poisson_binom_cdf test", "[poisson_binom_cdf][xsf_tests]") {
         CAPTURE(i, results[i], expected[i], rtol, rel_error);
         REQUIRE(rel_error <= rtol);
     }
+}
+
+TEMPLATE_TEST_CASE("poisson_binom_sf table", "[poisson_binom_sf][xsf_tests]", float, double) {
+    using T = TestType;
+    std::array<T, 4> ps = {T(1) / 8, T(1) / 4, T(1) / 2, T(3) / 4};
+    // Exact upper-tail probabilities for these dyadic inputs.
+    const std::array<T, 5> expected = {T(235) / 256, T(141) / 256, T(37) / 256, T(3) / 256, T(0)};
+    std::array<T, 5> results;
+    results.fill(T(-1));
+
+    xsf::poisson_binom_sf_all(std::mdspan(ps.data(), ps.size()), std::mdspan(results.data(), results.size()));
+
+    REQUIRE(results == expected);
+}
+
+TEMPLATE_TEST_CASE("poisson_binom_sf small upper tails", "[poisson_binom_sf][xsf_tests]", float, double) {
+    using T = TestType;
+    std::vector<T> ps;
+    std::size_t k = 0;
+    T expected = T(0);
+
+    // scipy/scipy#26409: subtracting the CDF from one loses these tails.
+    SECTION("heterogeneous probabilities") {
+        for (int i = 0; i < 32; ++i) {
+            ps.push_back(T(1 + i % 9) / 128);
+        }
+        k = 23;
+        // Computed by convolving Bernoulli distributions using exact rational arithmetic.
+        expected = T(1.1963531710514960e-29);
+    }
+    SECTION("probabilities whose complements round to one") {
+        ps.assign(16, T(1e-20));
+        expected = T(1.6e-19);
+    }
+    SECTION("smallest subnormal input") {
+        ps.assign(16, std::numeric_limits<T>::denorm_min());
+        expected = T(16) * std::numeric_limits<T>::denorm_min();
+    }
+    SECTION("tail below the floating-point range") {
+        ps.assign(256, T(1) / 128);
+        k = 249;
+        // The exact probability is about 5.54e-516, which rounds to zero.
+    }
+
+    std::vector<T> results(ps.size() + 1, T(-1));
+    xsf::poisson_binom_sf_all(std::mdspan(ps.data(), ps.size()), std::mdspan(results.data(), results.size()));
+
+    const double rtol = 32 * std::numeric_limits<T>::epsilon();
+    const double rel_error = xsf::extended_relative_error(results[k], expected);
+    CAPTURE(k, results[k], expected, rel_error, rtol);
+    REQUIRE(rel_error <= rtol);
+    REQUIRE(results.back() == T(0));
+    for (std::size_t i = 0; i < results.size(); ++i) {
+        REQUIRE(results[i] >= T(0));
+        REQUIRE(results[i] <= T(1));
+        if (i > 0) {
+            REQUIRE(results[i] <= results[i - 1]);
+        }
+    }
+}
+
+TEMPLATE_TEST_CASE("poisson_binom_sf boundaries", "[poisson_binom_sf][xsf_tests]", float, double) {
+    using T = TestType;
+    std::vector<T> ps;
+    std::vector<T> expected;
+
+    SECTION("no trials") { expected = {T(0)}; }
+    SECTION("one trial") {
+        T p = GENERATE(T(0), T(0.125), T(1));
+        ps = {p};
+        expected = {p, T(0)};
+    }
+    SECTION("deterministic trials") {
+        ps = {T(0), T(1), T(0), T(1)};
+        expected = {T(1), T(1), T(0), T(0), T(0)};
+    }
+
+    std::vector<T> results(ps.size() + 1, T(-1));
+    xsf::poisson_binom_sf_all(std::mdspan(ps.data(), ps.size()), std::mdspan(results.data(), results.size()));
+    REQUIRE(results == expected);
+}
+
+TEST_CASE("poisson_binom_sf output size", "[poisson_binom_sf][xsf_tests]") {
+    std::array<double, 2> ps = {0.25, 0.75};
+    auto size = GENERATE(std::size_t(0), std::size_t(2), std::size_t(4));
+    std::vector<double> results(size, -1.0);
+
+    xsf::poisson_binom_sf_all(std::mdspan(ps.data(), ps.size()), std::mdspan(results.data(), results.size()));
+
+    for (double value : results) {
+        REQUIRE(value == -1.0);
+    }
+}
+
+TEMPLATE_TEST_CASE("poisson_binom_sf strided views", "[poisson_binom_sf][xsf_tests]", float, double) {
+    using T = TestType;
+    using Extents = std::dextents<std::size_t, 1>;
+    using Mapping = std::layout_stride::mapping<Extents>;
+    auto input_stride = GENERATE(std::size_t(1), std::size_t(2));
+    auto output_stride = GENERATE(std::size_t(1), std::size_t(3));
+    std::array<T, 4> ps = {T(0.25), T(0.75), T(-1), T(-1)};
+    if (input_stride == 2) {
+        ps = {T(0.25), T(-1), T(0.75), T(-1)};
+    }
+    std::array<T, 9> results;
+    results.fill(T(-1));
+    std::mdspan<const T, Extents, std::layout_stride> p_span(
+        ps.data(), Mapping(Extents(2), std::array<std::size_t, 1>{input_stride})
+    );
+    std::mdspan<T, Extents, std::layout_stride> res_span(
+        results.data(), Mapping(Extents(3), std::array<std::size_t, 1>{output_stride})
+    );
+
+    xsf::poisson_binom_sf_all(p_span, res_span);
+
+    const std::array<T, 3> expected = {T(0.8125), T(0.1875), T(0)};
+    for (std::size_t i = 0; i < results.size(); ++i) {
+        if (i % output_stride == 0 && i / output_stride < expected.size()) {
+            REQUIRE(results[i] == expected[i / output_stride]);
+        } else {
+            REQUIRE(results[i] == T(-1));
+        }
+    }
+}
+
+TEST_CASE("take_from_discrete_sf boundaries", "[poisson_binom_sf][xsf_tests]") {
+    std::array<double, 3> values = {0.75, 0.25, 0.0};
+    std::mdspan sf(values.data(), values.size());
+
+    REQUIRE(xsf::take_from_discrete_sf(sf, -1) == 1.0);
+    REQUIRE(xsf::take_from_discrete_sf(sf, std::numeric_limits<std::int64_t>::min()) == 1.0);
+    REQUIRE(xsf::take_from_discrete_sf(sf, 0) == 0.75);
+    REQUIRE(xsf::take_from_discrete_sf(sf, 1) == 0.25);
+    REQUIRE(xsf::take_from_discrete_sf(sf, 2) == 0.0);
+    REQUIRE(xsf::take_from_discrete_sf(sf, 3) == 0.0);
+    REQUIRE(xsf::take_from_discrete_sf(sf, std::numeric_limits<std::int64_t>::max()) == 0.0);
+    REQUIRE(xsf::take_from_discrete_sf(sf, std::numeric_limits<std::uint64_t>::max()) == 0.0);
+
+    std::array<double, 1> empty_distribution = {0.0};
+    std::mdspan empty_sf(empty_distribution.data(), empty_distribution.size());
+    REQUIRE(xsf::take_from_discrete_sf(empty_sf, -1) == 1.0);
+    REQUIRE(xsf::take_from_discrete_sf(empty_sf, 0) == 0.0);
 }
