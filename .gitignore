@@ -46,3 +46,6 @@ build/
 
 # xsref
 xsref/
+
+# macOS metadata
+.DS_Store
