@@ -411,7 +411,9 @@ namespace detail {
             // midpoint tie upward, because crossings only add to the tail.
             positive_remainder |= probability > 0 && crossing_mass.hi > 0 && crossing.hi == 0 && crossing.lo == 0;
             tail = tail.add(crossing);
-            for (Index j = k; j > 0; --j) {
+            // After trial i, bins above i+1 are still unreachable.
+            const Index last = cxx::min(k, static_cast<Index>(i + 1));
+            for (Index j = last; j > 0; --j) {
                 auto mass = masses.get(j);
                 auto removed = mass.multiply(probability);
                 auto incoming = masses.get(j - 1).multiply(probability);
