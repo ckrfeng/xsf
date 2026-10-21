@@ -264,7 +264,31 @@ XSF_HOST_DEVICE inline float tukeylambdacdf(float x, float lmbda) {
 
 namespace detail {
 
-    template <typename InputMat, typename OutputMat>
+    template <bool PreserveSubnormals, typename A, typename B>
+    XSF_HOST_DEVICE inline auto poisson_binom_multiply(A a, B b) {
+#if defined(__CUDA_ARCH__)
+        if constexpr (PreserveSubnormals && cxx::is_same_v<A, float> && cxx::is_same_v<B, float>) {
+            // CuPy enables FTZ. This intrinsic preserves subnormal inputs and
+            // results independently of that compiler setting.
+            return __fmaf_ieee_rn(a, b, 0.0f);
+        }
+#endif
+        return a * b;
+    }
+
+    template <typename T>
+    XSF_HOST_DEVICE inline double poisson_binom_probability(T p) {
+#if defined(__CUDA_ARCH__)
+        if constexpr (cxx::is_same_v<T, float>) {
+            // Scaling is exact for probabilities in [0, 1] and makes even the
+            // smallest float normal before conversion to double under FTZ.
+            return static_cast<double>(__fmaf_ieee_rn(p, 0x1p126f, 0.0f)) * 0x1p-126;
+        }
+#endif
+        return static_cast<double>(p);
+    }
+
+    template <typename InputMat, typename OutputMat, bool PreserveSubnormals = false>
     XSF_HOST_DEVICE inline void
     poisson_binom_pmf_all_impl(InputMat p, OutputMat res, typename OutputMat::value_type scale = 1) {
         using T = typename OutputMat::value_type;
@@ -280,13 +304,21 @@ namespace detail {
             return;
         }
 
-        res(0) = (T(1) - p(0)) * scale;
-        res(1) = p(0) * scale;
+        res(0) = poisson_binom_multiply<PreserveSubnormals>(T(1) - p(0), scale);
+        res(1) = poisson_binom_multiply<PreserveSubnormals>(p(0), scale);
 
         for (decltype(n) i = 1; i < n; i++) {
             T p_i = p(i);
             T q_i = 1 - p_i;
             for (decltype(n) j = i + 1; j >= 1; j--) {
+#if defined(__CUDA_ARCH__)
+                if constexpr (PreserveSubnormals && cxx::is_same_v<T, float>) {
+                    T mass = res(j - 1);
+                    res(j) = __fmaf_ieee_rn(mass, p_i, res(j));
+                    res(j - 1) = __fmaf_ieee_rn(mass, q_i, 0.0f);
+                    continue;
+                }
+#endif
                 T tmp = res(j - 1) * p_i;
                 res(j - 1) *= q_i;
                 res(j) += tmp;
@@ -328,7 +360,7 @@ namespace detail {
             (difference == -low && (positive_remainder || (static_cast<cxx::uint64_t>(units) & 1)))) {
             units += 1;
         }
-        return static_cast<T>(units) * cxx::numeric_limits<T>::denorm_min();
+        return poisson_binom_multiply<true>(static_cast<T>(units), cxx::numeric_limits<T>::denorm_min());
     }
 
     template <typename WorkspaceMat>
@@ -359,7 +391,7 @@ namespace detail {
         // contributions to an already accumulated tail are not cancelled.
         auto start = 2 * masses.offset;
         for (decltype(p.extent(0)) i = 0; i < p.extent(0); ++i) {
-            double probability = static_cast<double>(p(i));
+            double probability = poisson_binom_probability(p(i));
             auto j = i;
             while (j > 0 && workspace(start + j - 1) < probability) {
                 workspace(start + j) = workspace(start + j - 1);
@@ -408,7 +440,7 @@ namespace detail {
                 }
             }
         }
-        return tail * cxx::numeric_limits<T>::min();
+        return poisson_binom_multiply<true>(tail, cxx::numeric_limits<T>::min());
     }
 
 } // namespace detail
@@ -484,7 +516,7 @@ XSF_HOST_DEVICE inline void poisson_binom_sf_all(InputMat p, OutputMat res, Work
     // underflow until the final conversion back to probabilities.
     const T unscale = cxx::numeric_limits<T>::min();
     const T scale = T(1) / unscale;
-    detail::poisson_binom_pmf_all_impl(p, res, scale);
+    detail::poisson_binom_pmf_all_impl<InputMat, OutputMat, true>(p, res, scale);
     // Sum the upper tail directly to avoid cancellation in 1 - cdf.
     T tail = T(0);
     for (decltype(n) i = n; i > 0; --i) {

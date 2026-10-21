@@ -115,6 +115,7 @@ class TestCuPy:
         "round-down", "tie", "tie-extra", "shifted", "empty", "below-range",
         "deterministic", "higher-round-up", "higher-round-down",
         "higher-tie", "higher-tie-extra", "higher-shifted", "higher-many",
+        "single-subnormal", "subnormal-inputs", "subnormal-sum",
     ])
     def test_poisson_binom_sf(self, dtype, order, case):
         from fractions import Fraction
@@ -134,6 +135,15 @@ class TestCuPy:
             k = 23
         elif case == "tiny":
             p = np.full(16, 1e-20, dtype=dtype)
+            k = 0
+        elif case == "single-subnormal":
+            p = np.array([subnormal], dtype=dtype)
+            k = 0
+        elif case == "subnormal-inputs":
+            p = np.full(16, subnormal, dtype=dtype)
+            k = 0
+        elif case == "subnormal-sum":
+            p = np.array([subnormal, 2 * subnormal, 3 * subnormal], dtype=dtype)
             k = 0
         elif case == "underflow":
             p = np.full(3, 1.7e-23 if is_float else 1e-162, dtype=dtype)
@@ -227,6 +237,8 @@ class TestCuPy:
             selected[3 * row + 2] = xsf::take_from_discrete_sf(output, n);
         }
         """
+        # Keep CuPy's normal FTZ setting: the SF helper must preserve tiny
+        # float inputs/results without requiring a different compilation mode.
         kernel = cupy.RawKernel(code.replace("SCALAR", scalar), "poisson_binom_sf", options=("--std=c++17",))
         inputs = cupy.array(np.stack([p, p[::-1]]), dtype=dtype, order=order)
         output = cupy.empty((2, p.size + 1), dtype=dtype, order=order)
@@ -254,7 +266,8 @@ class TestCuPy:
         np.testing.assert_array_equal(choices[:, 2], np.zeros(2, dtype=dtype))
         if case.startswith("higher-") or case in {
             "underflow", "round-up", "round-down", "tie", "tie-extra",
-            "shifted", "below-range",
+            "shifted", "below-range", "single-subnormal", "subnormal-inputs",
+            "subnormal-sum",
         }:
             np.testing.assert_array_equal(choices[:, 1], np.full(2, expected[k], dtype=dtype))
 
