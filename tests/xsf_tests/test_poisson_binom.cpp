@@ -5,6 +5,14 @@
 #include <xsf/stats.h>
 #include <xsf/third_party/kokkos/mdspan.hpp>
 
+namespace {
+template <typename InputMat, typename OutputMat>
+void poisson_binom_sf(InputMat p, OutputMat res) {
+    std::vector<double> workspace(3 * (p.extent(0) + 1));
+    xsf::poisson_binom_sf_all(p, res, std::mdspan(workspace.data(), workspace.size()));
+}
+} // namespace
+
 TEST_CASE("poisson_binom_pmf test", "[poisson_binom_pmf][xsf_tests]") {
     // Reference values computed from scipy.stats._stats_pythran
     // import numpy as np
@@ -92,7 +100,7 @@ TEMPLATE_TEST_CASE("poisson_binom_sf table", "[poisson_binom_sf][xsf_tests]", fl
     std::array<T, 5> results;
     results.fill(T(-1));
 
-    xsf::poisson_binom_sf_all(std::mdspan(ps.data(), ps.size()), std::mdspan(results.data(), results.size()));
+    poisson_binom_sf(std::mdspan(ps.data(), ps.size()), std::mdspan(results.data(), results.size()));
 
     REQUIRE(results == expected);
 }
@@ -127,7 +135,7 @@ TEMPLATE_TEST_CASE("poisson_binom_sf small upper tails", "[poisson_binom_sf][xsf
     }
 
     std::vector<T> results(ps.size() + 1, T(-1));
-    xsf::poisson_binom_sf_all(std::mdspan(ps.data(), ps.size()), std::mdspan(results.data(), results.size()));
+    poisson_binom_sf(std::mdspan(ps.data(), ps.size()), std::mdspan(results.data(), results.size()));
 
     const double rtol = 32 * std::numeric_limits<T>::epsilon();
     const double rel_error = xsf::extended_relative_error(results[k], expected);
@@ -162,7 +170,7 @@ TEMPLATE_TEST_CASE("poisson_binom_sf intermediate underflow", "[poisson_binom_sf
     }
     std::vector<T> results(ps.size() + 1, T(-1));
 
-    xsf::poisson_binom_sf_all(std::mdspan(ps.data(), ps.size()), std::mdspan(results.data(), results.size()));
+    poisson_binom_sf(std::mdspan(ps.data(), ps.size()), std::mdspan(results.data(), results.size()));
 
     CAPTURE(n, padding, results[1 + padding], expected);
     REQUIRE(results[1 + padding] == expected);
@@ -184,7 +192,7 @@ TEMPLATE_TEST_CASE("poisson_binom_sf subnormal rounding", "[poisson_binom_sf][xs
     }
     std::vector<T> results(ps.size() + 1, T(-1));
 
-    xsf::poisson_binom_sf_all(std::mdspan(ps.data(), ps.size()), std::mdspan(results.data(), results.size()));
+    poisson_binom_sf(std::mdspan(ps.data(), ps.size()), std::mdspan(results.data(), results.size()));
 
     // Exact rational convolution puts center just above the zero/subnormal
     // midpoint, and its predecessor just below it, for both types.
@@ -216,7 +224,7 @@ TEMPLATE_TEST_CASE("poisson_binom_sf subnormal ties", "[poisson_binom_sf][xsf_te
     }
     std::vector<T> results(ps.size() + 1, T(-1));
 
-    xsf::poisson_binom_sf_all(std::mdspan(ps.data(), ps.size()), std::mdspan(results.data(), results.size()));
+    poisson_binom_sf(std::mdspan(ps.data(), ps.size()), std::mdspan(results.data(), results.size()));
 
     // first * second is exactly half the smallest subnormal. An additional
     // possible success makes the tail strictly larger than the midpoint.
@@ -224,6 +232,102 @@ TEMPLATE_TEST_CASE("poisson_binom_sf subnormal ties", "[poisson_binom_sf][xsf_te
     T expected = positive ? std::numeric_limits<T>::denorm_min() : T(0);
     CAPTURE(direction, extra_trial, reverse, shift, results[1 + shift], expected);
     REQUIRE(results[1 + shift] == expected);
+}
+
+TEMPLATE_TEST_CASE("poisson_binom_sf higher-order ties", "[poisson_binom_sf][xsf_tests]", float, double) {
+    using T = TestType;
+    constexpr int exponent = std::numeric_limits<T>::min_exponent - std::numeric_limits<T>::digits - 1;
+    const int successes = GENERATE(3, 4, 8, 25, 64);
+    const int direction = GENERATE(-1, 0, 1);
+    const bool extra_trial = GENERATE(false, true);
+    const bool reverse = GENERATE(false, true);
+    const int shift = GENERATE(0, 2);
+    std::vector<T> ps(successes, std::ldexp(T(1), exponent / successes));
+    ps.back() = std::ldexp(T(1), exponent - (successes - 1) * (exponent / successes));
+    if (direction) {
+        ps.front() = std::nextafter(ps.front(), direction < 0 ? T(0) : T(1));
+    }
+    if (extra_trial) {
+        ps.push_back(std::numeric_limits<T>::denorm_min());
+    }
+    if (shift) {
+        ps.insert(ps.begin(), T(1));
+        ps.push_back(T(1));
+        ps.push_back(T(0));
+    }
+    if (reverse) {
+        std::reverse(ps.begin(), ps.end());
+    }
+    std::vector<T> results(ps.size() + 1, T(-1));
+
+    poisson_binom_sf(std::mdspan(ps.data(), ps.size()), std::mdspan(results.data(), results.size()));
+
+    // The product is exactly half the smallest subnormal before perturbation.
+    // An extra possible success moves this tail strictly above the midpoint.
+    const bool positive = direction > 0 || (direction == 0 && extra_trial);
+    const T expected = positive ? std::numeric_limits<T>::denorm_min() : T(0);
+    CAPTURE(successes, direction, extra_trial, reverse, shift, results[successes - 1 + shift], expected);
+    REQUIRE(results[successes - 1 + shift] == expected);
+}
+
+TEST_CASE("poisson_binom_sf higher-order binomial rounding", "[poisson_binom_sf][xsf_tests]") {
+    const int fixture = GENERATE(0, 1, 2, 3, 4, 5);
+    const int ns[] = {4, 5, 12, 32, 32, 32};
+    const int successes[] = {3, 3, 5, 7, 7, 8};
+    const float ps[] = {0x1.428a30p-51f, 0x1.db4c78p-52f, 0x1.0d7f64p-32f,
+                        0x1.638db2p-25f, 0x1.638db4p-25f, 0x1.42bbe2p-22f};
+    std::vector<float> probabilities(ns[fixture], ps[fixture]);
+    std::vector<float> results(probabilities.size() + 1, -1);
+
+    poisson_binom_sf(
+        std::mdspan(probabilities.data(), probabilities.size()), std::mdspan(results.data(), results.size())
+    );
+
+    // Exact rational binomial sums are just above the zero/subnormal midpoint.
+    CAPTURE(fixture, ns[fixture], successes[fixture], results[successes[fixture] - 1]);
+    REQUIRE(results[successes[fixture] - 1] == std::numeric_limits<float>::denorm_min());
+}
+
+TEST_CASE("poisson_binom_sf workspace size", "[poisson_binom_sf][xsf_tests]") {
+    std::array<double, 2> ps = {0.25, 0.75};
+    std::array<double, 3> results = {-1, -1, -1};
+    auto size = GENERATE(std::size_t(0), std::size_t(8), std::size_t(10));
+    std::vector<double> workspace(size, -1);
+
+    xsf::poisson_binom_sf_all(
+        std::mdspan(ps.data(), ps.size()), std::mdspan(results.data(), results.size()),
+        std::mdspan(workspace.data(), workspace.size())
+    );
+
+    REQUIRE(std::all_of(results.begin(), results.end(), [](double x) { return x == -1; }));
+    REQUIRE(std::all_of(workspace.begin(), workspace.end(), [](double x) { return x == -1; }));
+}
+
+TEMPLATE_TEST_CASE("poisson_binom_sf strided workspace", "[poisson_binom_sf][xsf_tests]", float, double) {
+    using T = TestType;
+    constexpr int exponent = std::numeric_limits<T>::min_exponent - std::numeric_limits<T>::digits - 1;
+    std::array<T, 4> ps = {
+        std::ldexp(T(1), exponent / 3), std::ldexp(T(1), exponent / 3), std::ldexp(T(1), exponent - 2 * (exponent / 3)),
+        std::numeric_limits<T>::denorm_min()
+    };
+    std::array<T, 5> results;
+    auto stride = GENERATE(std::size_t(1), std::size_t(3));
+    std::array<double, 45> workspace;
+    workspace.fill(-1);
+    using Extents = std::dextents<std::size_t, 1>;
+    using Mapping = std::layout_stride::mapping<Extents>;
+    std::mdspan<double, Extents, std::layout_stride> scratch(
+        workspace.data(), Mapping(Extents(15), std::array<std::size_t, 1>{stride})
+    );
+
+    xsf::poisson_binom_sf_all(std::mdspan(ps.data(), ps.size()), std::mdspan(results.data(), results.size()), scratch);
+
+    REQUIRE(results[2] == std::numeric_limits<T>::denorm_min());
+    for (std::size_t i = 0; i < workspace.size(); ++i) {
+        if (i % stride != 0 || i / stride >= 15) {
+            REQUIRE(workspace[i] == -1);
+        }
+    }
 }
 
 TEMPLATE_TEST_CASE("poisson_binom_sf boundaries", "[poisson_binom_sf][xsf_tests]", float, double) {
@@ -243,7 +347,7 @@ TEMPLATE_TEST_CASE("poisson_binom_sf boundaries", "[poisson_binom_sf][xsf_tests]
     }
 
     std::vector<T> results(ps.size() + 1, T(-1));
-    xsf::poisson_binom_sf_all(std::mdspan(ps.data(), ps.size()), std::mdspan(results.data(), results.size()));
+    poisson_binom_sf(std::mdspan(ps.data(), ps.size()), std::mdspan(results.data(), results.size()));
     REQUIRE(results == expected);
 }
 
@@ -252,7 +356,7 @@ TEST_CASE("poisson_binom_sf output size", "[poisson_binom_sf][xsf_tests]") {
     auto size = GENERATE(std::size_t(0), std::size_t(2), std::size_t(4));
     std::vector<double> results(size, -1.0);
 
-    xsf::poisson_binom_sf_all(std::mdspan(ps.data(), ps.size()), std::mdspan(results.data(), results.size()));
+    poisson_binom_sf(std::mdspan(ps.data(), ps.size()), std::mdspan(results.data(), results.size()));
 
     for (double value : results) {
         REQUIRE(value == -1.0);
@@ -278,7 +382,7 @@ TEMPLATE_TEST_CASE("poisson_binom_sf strided views", "[poisson_binom_sf][xsf_tes
         results.data(), Mapping(Extents(3), std::array<std::size_t, 1>{output_stride})
     );
 
-    xsf::poisson_binom_sf_all(p_span, res_span);
+    poisson_binom_sf(p_span, res_span);
 
     const std::array<T, 3> expected = {T(0.8125), T(0.1875), T(0)};
     for (std::size_t i = 0; i < results.size(); ++i) {

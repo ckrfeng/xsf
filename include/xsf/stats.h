@@ -315,23 +315,8 @@ namespace detail {
         }
     };
 
-    template <typename InputMat, typename T>
-    XSF_HOST_DEVICE inline T poisson_binom_sf_two_successes(InputMat p, T scale) {
-        // Track zero, one, and at least two non-deterministic successes. This
-        // constant-storage recurrence avoids subtracting nearly equal CDFs.
-        poisson_binom_compensated zero{static_cast<double>(scale), 0}, one{0, 0}, tail{0, 0};
-        for (decltype(p.extent(0)) i = 0; i < p.extent(0); ++i) {
-            double probability = static_cast<double>(p(i));
-            if (probability == 0 || probability == 1) {
-                continue;
-            }
-            auto first = zero.multiply(probability);
-            auto second = one.multiply(probability);
-            tail = tail.add(second);
-            one = one.add(first).add({-second.hi, -second.lo});
-            zero = zero.add({-first.hi, -first.lo});
-        }
-
+    template <typename T>
+    XSF_HOST_DEVICE inline T poisson_binom_round_subnormal(poisson_binom_compensated tail, bool positive_remainder) {
         // Round in units of the output type's smallest subnormal. Keep the
         // low component when deciding which side of a halfway point we are on.
         constexpr int bits = cxx::numeric_limits<T>::digits - 1;
@@ -339,10 +324,91 @@ namespace detail {
         double low = cxx::ldexp(tail.lo, bits);
         double units = cxx::floor(high);
         double difference = (high - units) - 0.5;
-        if (difference > -low || (difference == -low && (static_cast<cxx::uint64_t>(units) & 1))) {
+        if (difference > -low ||
+            (difference == -low && (positive_remainder || (static_cast<cxx::uint64_t>(units) & 1)))) {
             units += 1;
         }
         return static_cast<T>(units) * cxx::numeric_limits<T>::denorm_min();
+    }
+
+    template <typename WorkspaceMat>
+    struct poisson_binom_workspace {
+        WorkspaceMat values;
+        decltype(values.extent(0)) offset;
+
+        template <typename Index>
+        XSF_HOST_DEVICE poisson_binom_compensated get(Index i) const {
+            return {values(i), values(i + offset)};
+        }
+
+        template <typename Index>
+        XSF_HOST_DEVICE void set(Index i, poisson_binom_compensated value) const {
+            values(i) = value.hi;
+            values(i + offset) = value.lo;
+        }
+    };
+
+    template <typename InputMat, typename WorkspaceMat, typename Index, typename T>
+    XSF_HOST_DEVICE inline T poisson_binom_sf_subnormal(InputMat p, Index k, WorkspaceMat workspace, T scale) {
+        poisson_binom_workspace<WorkspaceMat> masses{workspace, workspace.extent(0) / 3};
+        for (Index j = 0; j <= k; ++j) {
+            masses.set(j, {0, 0});
+        }
+        masses.set(0, {static_cast<double>(scale), 0});
+        // Process the smallest probabilities last, so their positive
+        // contributions to an already accumulated tail are not cancelled.
+        auto start = 2 * masses.offset;
+        for (decltype(p.extent(0)) i = 0; i < p.extent(0); ++i) {
+            double probability = static_cast<double>(p(i));
+            auto j = i;
+            while (j > 0 && workspace(start + j - 1) < probability) {
+                workspace(start + j) = workspace(start + j - 1);
+                --j;
+            }
+            workspace(start + j) = probability;
+        }
+        poisson_binom_compensated tail{0, 0};
+        bool positive_remainder = false;
+        for (decltype(p.extent(0)) i = 0; i < p.extent(0); ++i) {
+            double probability = workspace(start + i);
+            // Once the threshold is reached, further trials cannot undo it.
+            // Accumulating only the new crossings avoids cancellation in the tail.
+            auto crossing_mass = masses.get(k);
+            auto crossing = crossing_mass.multiply(probability);
+            // Even a contribution below the workspace's range breaks an exact
+            // midpoint tie upward, because crossings only add to the tail.
+            positive_remainder |= probability > 0 && crossing_mass.hi > 0 && crossing.hi == 0 && crossing.lo == 0;
+            tail = tail.add(crossing);
+            for (Index j = k; j > 0; --j) {
+                auto mass = masses.get(j);
+                auto removed = mass.multiply(probability);
+                auto incoming = masses.get(j - 1).multiply(probability);
+                masses.set(j, mass.add({-removed.hi, -removed.lo}).add(incoming));
+            }
+            // Keep the complement exact even when 1-p rounds to one.
+            auto mass = masses.get(0);
+            auto removed = mass.multiply(probability);
+            masses.set(0, mass.add({-removed.hi, -removed.lo}));
+        }
+        return poisson_binom_round_subnormal<T>(tail, positive_remainder);
+    }
+
+    template <typename InputMat, typename WorkspaceMat, typename Index, typename T>
+    XSF_HOST_DEVICE inline T poisson_binom_sf_round(InputMat p, Index k, WorkspaceMat workspace, T tail, T scale) {
+        if constexpr (cxx::is_same_v<T, float> || cxx::is_same_v<T, double>) {
+            if (tail > T(0) && tail <= T(1)) {
+                constexpr int bits = cxx::numeric_limits<T>::digits - 1;
+                double units = cxx::ldexp(static_cast<double>(tail), bits);
+                double midpoint_distance = cxx::abs((units - cxx::floor(units)) - 0.5);
+                // Recompute only near the zero/subnormal midpoint. Repeating
+                // the convolution for every subnormal would be too expensive.
+                double tolerance = 8 * static_cast<double>(p.extent(0)) * cxx::numeric_limits<T>::epsilon() * units;
+                if (units <= 1 && midpoint_distance <= tolerance) {
+                    return poisson_binom_sf_subnormal(p, k, workspace, scale);
+                }
+            }
+        }
+        return tail * cxx::numeric_limits<T>::min();
     }
 
 } // namespace detail
@@ -389,10 +455,13 @@ XSF_HOST_DEVICE inline void poisson_binom_cdf_all(InputMat p, OutputMat res) {
     res(n) = T(1);
 }
 
-template <typename InputMat, typename OutputMat>
-XSF_HOST_DEVICE inline void poisson_binom_sf_all(InputMat p, OutputMat res) {
+template <typename InputMat, typename OutputMat, typename WorkspaceMat>
+XSF_HOST_DEVICE inline void poisson_binom_sf_all(InputMat p, OutputMat res, WorkspaceMat workspace) {
     /* Outputs the full sf of a Poisson-Binomial distribution.
      * p and res have the same requirements as for poisson_binom_pmf_all.
+     * workspace is a disjoint 1d view of 3*(n+1) doubles, used for the
+     * compensated convolution when subnormal tails need extra precision.
+     * Input, output, and workspace storage must not overlap.
      * Upon completion, res(k) contains P(S > k) for k from 0 to n.
      */
     using T = typename OutputMat::value_type;
@@ -404,6 +473,12 @@ XSF_HOST_DEVICE inline void poisson_binom_sf_all(InputMat p, OutputMat res) {
         return;
     }
 
+    if (workspace.extent(0) != 3 * (n + 1)) {
+        set_error("_poisson_binom_sf_all", SF_ERROR_MEMORY, "workspace.shape[-1] must be 3*(p.shape[-1] + 1)");
+        return;
+    }
+    static_assert(cxx::is_same_v<typename WorkspaceMat::value_type, double>, "workspace must contain doubles");
+
     // A power-of-two scale preserves tiny masses during convolution. Its reciprocal
     // is the smallest normal value, so relevant subnormal tails stay well above
     // underflow until the final conversion back to probabilities.
@@ -414,22 +489,10 @@ XSF_HOST_DEVICE inline void poisson_binom_sf_all(InputMat p, OutputMat res) {
     T tail = T(0);
     for (decltype(n) i = n; i > 0; --i) {
         T mass = res(i);
-        res(i) = tail * unscale;
+        res(i) = detail::poisson_binom_sf_round(p, i, workspace, tail, scale);
         tail = cxx::min(tail + mass, scale);
     }
-    res(0) = tail * unscale;
-
-    if constexpr (cxx::is_same_v<T, float> || cxx::is_same_v<T, double>) {
-        // Recompute the first nontrivial stochastic upper tail when its
-        // conversion to a subnormal needs a more precise rounding decision.
-        decltype(n) certain = 0;
-        for (decltype(n) i = 0; i < n; ++i) {
-            certain += p(i) == T(1);
-        }
-        if (certain + 1 < n && res(certain + 1) <= unscale) {
-            res(certain + 1) = detail::poisson_binom_sf_two_successes(p, scale);
-        }
-    }
+    res(0) = detail::poisson_binom_sf_round(p, decltype(n)(0), workspace, tail, scale);
 }
 
 template <typename InputMat, typename Int>
