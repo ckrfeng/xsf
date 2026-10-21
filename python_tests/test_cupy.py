@@ -113,7 +113,8 @@ class TestCuPy:
     @pytest.mark.parametrize("case", [
         "dyadic", "heterogeneous", "tiny", "underflow", "round-up",
         "round-down", "tie", "tie-extra", "shifted", "empty", "below-range",
-        "deterministic",
+        "deterministic", "higher-round-up", "higher-round-down",
+        "higher-tie", "higher-tie-extra", "higher-shifted", "higher-many",
     ])
     def test_poisson_binom_sf(self, dtype, order, case):
         from fractions import Fraction
@@ -151,6 +152,26 @@ class TestCuPy:
             ], dtype=dtype)
             if case == "tie-extra":
                 p = np.append(p, subnormal)
+        elif case in {"higher-round-up", "higher-round-down"} and is_float:
+            probability = dtype(float.fromhex("0x1.428a30p-51"))
+            if case == "higher-round-down":
+                probability = np.nextafter(probability, dtype(0))
+            p = np.full(4, probability, dtype=dtype)
+            k = 2
+        elif case.startswith("higher-"):
+            successes = 25 if case == "higher-many" else 3
+            exponent = info.minexp - info.nmant - 1
+            first_exponent = int(exponent / successes)
+            p = np.full(successes, np.ldexp(dtype(1), first_exponent), dtype=dtype)
+            p[-1] = np.ldexp(dtype(1), exponent - (successes - 1) * first_exponent)
+            k = successes - 1
+            if case == "higher-round-down":
+                p[0] = np.nextafter(p[0], dtype(0))
+            if case in {"higher-round-up", "higher-tie-extra", "higher-shifted", "higher-many"}:
+                p = np.append(p, subnormal)
+            if case == "higher-shifted":
+                p = np.concatenate(([dtype(1)], p, [dtype(1), dtype(0)]))
+                k += 2
         elif case == "empty":
             p = np.empty(0, dtype=dtype)
             k = 0
@@ -181,7 +202,7 @@ class TestCuPy:
         expected = np.array(references[::-1], dtype=dtype)
 
         scalar = "float" if is_float else "double"
-        code = get_preamble("xsf/stats.h") + r"""
+        code = "#include <cupy/complex.cuh>\n" + get_preamble("xsf/stats.h") + r"""
         template <typename T>
         struct PoissonBinomialView {
             using value_type = T;
@@ -191,15 +212,16 @@ class TestCuPy:
             __device__ T &operator()(long long i) const { return data[i * stride]; }
         };
         extern "C" __global__ void poisson_binom_sf(
-            const SCALAR *p, SCALAR *out, SCALAR *selected,
+            const SCALAR *p, SCALAR *out, SCALAR *selected, double *workspace,
             long long n, long long rows, long long p_row, long long p_core,
-            long long out_row, long long out_core, long long k
+            long long out_row, long long out_core, long long work_row, long long work_core, long long k
         ) {
             long long row = blockIdx.x * blockDim.x + threadIdx.x;
             if (row >= rows) { return; }
             PoissonBinomialView<const SCALAR> input{p + row * p_row, n, p_core};
             PoissonBinomialView<SCALAR> output{out + row * out_row, n + 1, out_core};
-            xsf::poisson_binom_sf_all(input, output);
+            PoissonBinomialView<double> scratch{workspace + row * work_row, 3 * (n + 1), work_core};
+            xsf::poisson_binom_sf_all(input, output, scratch);
             selected[3 * row] = xsf::take_from_discrete_sf(output, -1LL);
             selected[3 * row + 1] = xsf::take_from_discrete_sf(output, k);
             selected[3 * row + 2] = xsf::take_from_discrete_sf(output, n);
@@ -209,11 +231,13 @@ class TestCuPy:
         inputs = cupy.array(np.stack([p, p[::-1]]), dtype=dtype, order=order)
         output = cupy.empty((2, p.size + 1), dtype=dtype, order=order)
         selected = cupy.empty((2, 3), dtype=dtype)
+        workspace = cupy.empty((2, 3 * (p.size + 1)), dtype=np.float64, order=order)
         itemsize = np.dtype(dtype).itemsize
         kernel((1,), (32,), (
-            inputs, output, selected, np.int64(p.size), np.int64(2),
+            inputs, output, selected, workspace, np.int64(p.size), np.int64(2),
             np.int64(inputs.strides[0] // itemsize), np.int64(inputs.strides[1] // itemsize),
-            np.int64(output.strides[0] // itemsize), np.int64(output.strides[1] // itemsize), np.int64(k),
+            np.int64(output.strides[0] // itemsize), np.int64(output.strides[1] // itemsize),
+            np.int64(workspace.strides[0] // workspace.itemsize), np.int64(workspace.strides[1] // workspace.itemsize), np.int64(k),
         ))
         result = cupy.asnumpy(output)
         choices = cupy.asnumpy(selected)
@@ -228,7 +252,10 @@ class TestCuPy:
         np.testing.assert_allclose(choices[:, 1], expected[k], rtol=rtol, atol=float(subnormal))
         np.testing.assert_array_equal(choices[:, 0], np.ones(2, dtype=dtype))
         np.testing.assert_array_equal(choices[:, 2], np.zeros(2, dtype=dtype))
-        if case in {"underflow", "round-up", "round-down", "tie", "tie-extra", "shifted", "below-range"}:
+        if case.startswith("higher-") or case in {
+            "underflow", "round-up", "round-down", "tie", "tie-extra",
+            "shifted", "below-range",
+        }:
             np.testing.assert_array_equal(choices[:, 1], np.full(2, expected[k], dtype=dtype))
 
     @pytest.mark.parametrize(
